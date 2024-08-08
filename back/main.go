@@ -4,30 +4,35 @@ import (
 	"encoding/json"
 	"log"
 	"net/http"
-	"sort"
 	"sync"
-	"time"
 
 	"github.com/gorilla/websocket"
 )
 
 type User struct {
-	ID       string    `json:"id"`
-	Name     string    `json:"name"`
-	JoinedAt time.Time `json:"joinedAt"`
-	IsHost   bool      `json:"isHost"`
+	ID       string `json:"id"`
+	Name     string `json:"name"`
+	IsHost   bool   `json:"isHost"`
+	Conn     *websocket.Conn `json:"-"`
 }
 
 type Message struct {
 	Type string `json:"type"`
 	ID   string `json:"id"`
 	Name string `json:"name"`
+	Size CanvasSize `json:"size,omitempty"`
+}
+
+type CanvasSize struct {
+	Width  int `json:"width"`
+	Height int `json:"height"`
 }
 
 var (
-	users    = make(map[*websocket.Conn]User)
+	users    = make(map[string]User)
 	usersMux sync.Mutex
-	host     *websocket.Conn
+	host     *User
+	canvasSize CanvasSize
 	upgrader = websocket.Upgrader{
 		CheckOrigin: func(r *http.Request) bool {
 			return true
@@ -44,100 +49,101 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	defer conn.Close()
 
 	for {
-		_, msg, err := conn.ReadMessage()
-		if err != nil {
-			removeUser(conn)
-			break
-		}
-
 		var message Message
-		if err := json.Unmarshal(msg, &message); err != nil {
+		err := conn.ReadJSON(&message)
+		if err != nil {
 			log.Println(err)
-			continue
+			removeUser(message.ID)
+			break
 		}
 
 		switch message.Type {
 		case "connect":
-			addUser(conn, User{ID: message.ID, Name: message.Name, JoinedAt: time.Now()})
+			addUser(message.ID, message.Name, conn)
+		case "canvasSize":
+			updateCanvasSize(message.Size)
 		}
 	}
 }
 
-func addUser(conn *websocket.Conn, user User) {
+func addUser(id, name string, conn *websocket.Conn) {
 	usersMux.Lock()
 	defer usersMux.Unlock()
 
+	newUser := User{ID: id, Name: name, Conn: conn}
 	if host == nil {
-		host = conn
-		user.IsHost = true
+		host = &newUser
+		newUser.IsHost = true
 	}
-	users[conn] = user
+	users[id] = newUser
+
 	broadcastUsers()
+	if !newUser.IsHost {
+		sendCanvasSizeToUser(conn)
+	}
 }
 
-func removeUser(conn *websocket.Conn) {
+func removeUser(id string) {
 	usersMux.Lock()
 	defer usersMux.Unlock()
 
-	isHost := users[conn].IsHost
-	delete(users, conn)
-
-	if isHost {
-		selectNewHost()
+	if users[id].IsHost {
+		host = nil
+		for _, user := range users {
+			if user.ID != id {
+				host = &user
+				user.IsHost = true
+				break
+			}
+		}
 	}
+	delete(users, id)
 	broadcastUsers()
 }
 
-func selectNewHost() {
-	if len(users) == 0 {
-		host = nil
-		return
-	}
-
-	var oldestUser *websocket.Conn
-	var oldestTime time.Time
-
-	for conn, user := range users {
-		if oldestUser == nil || user.JoinedAt.Before(oldestTime) {
-			oldestUser = conn
-			oldestTime = user.JoinedAt
-		}
-	}
-
-	host = oldestUser
-	user := users[host]
-	user.IsHost = true
-	users[host] = user
+func updateCanvasSize(size CanvasSize) {
+	canvasSize = size
+	broadcastCanvasSize()
 }
 
 func broadcastUsers() {
 	usersList := make([]User, 0, len(users))
 	for _, user := range users {
-		usersList = append(usersList, user)
+		usersList = append(usersList, User{ID: user.ID, Name: user.Name, IsHost: user.IsHost})
 	}
-
-	sort.Slice(usersList, func(i, j int) bool {
-		return usersList[i].JoinedAt.Before(usersList[j].JoinedAt)
-	})
 
 	message, _ := json.Marshal(map[string]interface{}{
 		"type":  "users",
 		"users": usersList,
 	})
 
-	for conn := range users {
-		conn.WriteMessage(websocket.TextMessage, message)
+	for _, user := range users {
+		user.Conn.WriteMessage(websocket.TextMessage, message)
 	}
 }
 
-func sendToHost(message []byte) {
-	if host != nil {
-		host.WriteMessage(websocket.TextMessage, message)
+func broadcastCanvasSize() {
+	message, _ := json.Marshal(map[string]interface{}{
+		"type": "canvasSize",
+		"size": canvasSize,
+	})
+
+	for _, user := range users {
+		if !user.IsHost {
+			user.Conn.WriteMessage(websocket.TextMessage, message)
+		}
 	}
+}
+
+func sendCanvasSizeToUser(conn *websocket.Conn) {
+	message, _ := json.Marshal(map[string]interface{}{
+		"type": "canvasSize",
+		"size": canvasSize,
+	})
+	conn.WriteMessage(websocket.TextMessage, message)
 }
 
 func main() {
 	http.HandleFunc("/ws", handleWebSocket)
-	log.Println("Start")
 	log.Fatal(http.ListenAndServe(":8080", nil))
 }
